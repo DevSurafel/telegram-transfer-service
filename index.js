@@ -126,15 +126,14 @@ app.post('/api/transfer-ownership', verifySecret, async (req, res) => {
 
     console.log('✅ Ownership transferred successfully to buyer');
 
-    // ✅ FIXED: Do NOT update job status to completed here
-    // ✅ FIXED: Do NOT update listing status to sold here
+    // ✅ UPDATED: Do NOT update status here - let the edge function handle it
     // The Lovable edge function will:
-    // 1. Update job status to "under_review"
-    // 2. Notify buyer to verify and approve payment on blockchain
-    // 3. Buyer's blockchain approval will release payment and mark job as completed
-    // 4. Smart contract automatically sends payment to seller + platform fee to platform wallet
+    // 1. Update job status to "completed"
+    // 2. Update listing status to "sold"
+    // 3. Notify both buyer and seller
+    // 4. Smart contract payment will be auto-released (handled by frontend or separate process)
     
-    console.log('💡 Transfer complete. Lovable edge function will handle status updates and payment release.');
+    console.log('💡 Transfer complete. Lovable edge function will handle status updates.');
 
     res.json({
       success: true,
