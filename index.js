@@ -121,40 +121,20 @@ app.post('/api/transfer-ownership', verifySecret, async (req, res) => {
 
     console.log('✅ Admin ownership verified');
 
-    // Transfer ownership
+    // Transfer ownership to buyer
     await transferChannelOwnership(channelUsername, buyerUsername);
 
-    console.log('✅ Ownership transferred successfully');
+    console.log('✅ Ownership transferred successfully to buyer');
 
-    // Update job status in Supabase
-    const { error: updateError } = await supabase
-      .from('jobs')
-      .update({
-        status: 'completed',
-        completed_at: new Date().toISOString(),
-      })
-      .eq('id', jobId);
-
-    if (updateError) {
-      console.error('❌ Failed to update job status:', updateError);
-    } else {
-      console.log('✅ Job status updated to completed');
-    }
-
-    // Update listing status
-    const { data: job } = await supabase
-      .from('jobs')
-      .select('listing_id')
-      .eq('id', jobId)
-      .single();
-
-    if (job) {
-      await supabase
-        .from('social_media_listings')
-        .update({ status: 'sold' })
-        .eq('id', job.listing_id);
-      console.log('✅ Listing marked as sold');
-    }
+    // ✅ FIXED: Do NOT update job status to completed here
+    // ✅ FIXED: Do NOT update listing status to sold here
+    // The Lovable edge function will:
+    // 1. Update job status to "under_review"
+    // 2. Notify buyer to verify and approve payment on blockchain
+    // 3. Buyer's blockchain approval will release payment and mark job as completed
+    // 4. Smart contract automatically sends payment to seller + platform fee to platform wallet
+    
+    console.log('💡 Transfer complete. Lovable edge function will handle status updates and payment release.');
 
     res.json({
       success: true,
