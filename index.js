@@ -49,7 +49,7 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     service: 'telegram-transfer-service',
     timestamp: new Date().toISOString(),
-    version: '1.0.0'
+    version: '2.0.0'
   });
 });
 
@@ -61,10 +61,33 @@ app.get('/', (req, res) => {
     endpoints: {
       health: 'GET /',
       checkOwnership: 'POST /api/check-ownership',
-      transferOwnership: 'POST /api/transfer-ownership'
+      transferOwnership: 'POST /api/transfer-ownership',
+      joinChannel: 'POST /api/join-channel'
     },
     note: 'All POST endpoints require X-API-Secret header'
   });
+});
+
+// Join channel endpoint (can be called separately if needed)
+app.post('/api/join-channel', verifySecret, async (req, res) => {
+  const { channelUsername } = req.body;
+
+  console.log('🚪 Join channel request:', { channelUsername });
+
+  if (!channelUsername) {
+    return res.status(400).json({ error: 'channelUsername is required' });
+  }
+
+  try {
+    const result = await joinChannelIfNeeded(channelUsername);
+    console.log('✅ Join result:', result);
+    res.json(result);
+  } catch (error) {
+    console.error('❌ Error joining channel:', error);
+    res.status(500).json({ 
+      error: error.message
+    });
+  }
 });
 
 // Check channel ownership endpoint
@@ -107,31 +130,52 @@ app.post('/api/transfer-ownership', verifySecret, async (req, res) => {
     console.log(`📋 Processing transfer for job ${jobId}`);
     console.log(`📢 Channel: ${channelUsername}, Buyer: ${buyerUsername}`);
 
-    // Check ownership first
+    // Step 1: Join channel if not already a member
+    console.log('🚪 Step 1: Ensuring escrow is in channel...');
+    await joinChannelIfNeeded(channelUsername);
+
+    // Step 2: Check ownership
+    console.log('🔍 Step 2: Checking ownership status...');
     const ownershipCheck = await checkChannelOwnership(channelUsername);
     
     if (!ownershipCheck.isOwner) {
-      console.log('⚠️ Admin is not the owner yet');
+      console.log('⚠️ Escrow is not the owner yet');
       return res.status(400).json({
         error: 'Transfer not ready',
         details: ownershipCheck,
-        instruction: 'Seller must first transfer channel ownership to admin account',
+        instruction: 'Seller must first transfer channel ownership to escrow account',
       });
     }
 
-    console.log('✅ Admin ownership verified');
+    console.log('✅ Escrow ownership verified');
 
-    // Transfer ownership to buyer
+    // Step 3: Remove all other admins
+    console.log('🧹 Step 3: Removing all other admins...');
+    const removedAdmins = await removeAllOtherAdmins(channelUsername);
+    console.log(`✅ Removed ${removedAdmins.length} admin(s)`);
+
+    // Step 4: Transfer ownership to buyer
+    console.log('🔄 Step 4: Transferring ownership to buyer...');
     await transferChannelOwnership(channelUsername, buyerUsername);
-
     console.log('✅ Ownership transferred successfully to buyer');
 
-    // Return success - edge function will handle everything else
+    // Step 5: Leave the channel
+    console.log('👋 Step 5: Escrow leaving the channel...');
+    await leaveChannel(channelUsername);
+    console.log('✅ Escrow left the channel');
+
+    // Return success
     res.json({
       success: true,
       message: 'Ownership transferred successfully',
       jobId,
-      transferComplete: true, // Signal that transfer is done
+      transferComplete: true,
+      steps: {
+        joined: true,
+        adminsRemoved: removedAdmins.length,
+        ownershipTransferred: true,
+        escrowLeft: true
+      }
     });
   } catch (error) {
     console.error('❌ Transfer error:', error);
@@ -141,6 +185,206 @@ app.post('/api/transfer-ownership', verifySecret, async (req, res) => {
     });
   }
 });
+
+// Join channel if not already a member
+async function joinChannelIfNeeded(channelUsername) {
+  let client = null;
+  try {
+    console.log('🔌 Creating client to check membership...');
+    
+    const session = new StringSession(ADMIN_SESSION_STRING.trim());
+    client = new TelegramClient(session, API_ID, API_HASH, {
+      connectionRetries: 5,
+    });
+
+    await client.connect();
+    console.log('✅ Connected to Telegram');
+
+    const normalizedUsername = channelUsername.startsWith('@') 
+      ? channelUsername.slice(1) 
+      : channelUsername;
+
+    console.log('📡 Fetching channel entity:', normalizedUsername);
+    const channel = await client.getEntity(normalizedUsername);
+    
+    const me = await client.getMe();
+
+    // Check if already a participant
+    let isMember = false;
+    try {
+      const participantInfo = await client.invoke(
+        new Api.channels.GetParticipant({
+          channel: channel,
+          participant: me,
+        })
+      );
+      isMember = true;
+      console.log('✅ Already a member of the channel');
+    } catch (error) {
+      if (error.errorMessage === 'USER_NOT_PARTICIPANT') {
+        console.log('⚠️ Not a member, joining now...');
+        isMember = false;
+      } else {
+        throw error;
+      }
+    }
+
+    // Join if not a member
+    if (!isMember) {
+      console.log('🚪 Joining channel...');
+      await client.invoke(
+        new Api.channels.JoinChannel({
+          channel: channel,
+        })
+      );
+      console.log('✅ Successfully joined the channel');
+      return { joined: true, alreadyMember: false };
+    }
+
+    return { joined: true, alreadyMember: true };
+  } catch (error) {
+    console.error('❌ Error in joinChannelIfNeeded:', error);
+    throw error;
+  } finally {
+    if (client) {
+      await client.disconnect();
+      console.log('🔌 Disconnected from Telegram');
+    }
+  }
+}
+
+// Remove all other admins
+async function removeAllOtherAdmins(channelUsername) {
+  let client = null;
+  try {
+    console.log('🔌 Creating client to remove admins...');
+    
+    const session = new StringSession(ADMIN_SESSION_STRING.trim());
+    client = new TelegramClient(session, API_ID, API_HASH, {
+      connectionRetries: 5,
+    });
+
+    await client.connect();
+
+    const normalizedUsername = channelUsername.startsWith('@') 
+      ? channelUsername.slice(1) 
+      : channelUsername;
+
+    const channel = await client.getEntity(normalizedUsername);
+    const me = await client.getMe();
+
+    console.log('📋 Fetching all participants...');
+    
+    // Get all admins
+    const participants = await client.invoke(
+      new Api.channels.GetParticipants({
+        channel: channel,
+        filter: new Api.ChannelParticipantsAdmins(),
+        offset: 0,
+        limit: 200,
+        hash: 0n,
+      })
+    );
+
+    const removedAdmins = [];
+
+    for (const participant of participants.participants) {
+      // Skip if it's the creator (escrow) or the current user
+      if (participant instanceof Api.ChannelParticipantCreator) {
+        console.log('⏭️ Skipping creator (escrow)');
+        continue;
+      }
+
+      if (participant.userId?.toString() === me.id.toString()) {
+        console.log('⏭️ Skipping self');
+        continue;
+      }
+
+      // Remove admin rights
+      try {
+        console.log(`🗑️ Removing admin: ${participant.userId}`);
+        
+        await client.invoke(
+          new Api.channels.EditAdmin({
+            channel: channel,
+            userId: participant.userId,
+            adminRights: new Api.ChatAdminRights({
+              changeInfo: false,
+              postMessages: false,
+              editMessages: false,
+              deleteMessages: false,
+              banUsers: false,
+              inviteUsers: false,
+              pinMessages: false,
+              addAdmins: false,
+              anonymous: false,
+              manageCall: false,
+              other: false,
+              manageTopics: false,
+            }),
+            rank: '',
+          })
+        );
+
+        removedAdmins.push(participant.userId.toString());
+        console.log(`✅ Removed admin rights from user ${participant.userId}`);
+      } catch (error) {
+        console.error(`❌ Failed to remove admin ${participant.userId}:`, error.message);
+        // Continue with other admins even if one fails
+      }
+    }
+
+    console.log(`✅ Removed ${removedAdmins.length} admin(s) in total`);
+    return removedAdmins;
+  } catch (error) {
+    console.error('❌ Error in removeAllOtherAdmins:', error);
+    throw error;
+  } finally {
+    if (client) {
+      await client.disconnect();
+      console.log('🔌 Disconnected from Telegram');
+    }
+  }
+}
+
+// Leave channel
+async function leaveChannel(channelUsername) {
+  let client = null;
+  try {
+    console.log('🔌 Creating client to leave channel...');
+    
+    const session = new StringSession(ADMIN_SESSION_STRING.trim());
+    client = new TelegramClient(session, API_ID, API_HASH, {
+      connectionRetries: 5,
+    });
+
+    await client.connect();
+
+    const normalizedUsername = channelUsername.startsWith('@') 
+      ? channelUsername.slice(1) 
+      : channelUsername;
+
+    const channel = await client.getEntity(normalizedUsername);
+
+    console.log('👋 Leaving channel...');
+    await client.invoke(
+      new Api.channels.LeaveChannel({
+        channel: channel,
+      })
+    );
+
+    console.log('✅ Successfully left the channel');
+    return { left: true };
+  } catch (error) {
+    console.error('❌ Error in leaveChannel:', error);
+    throw error;
+  } finally {
+    if (client) {
+      await client.disconnect();
+      console.log('🔌 Disconnected from Telegram');
+    }
+  }
+}
 
 // Check channel ownership function
 async function checkChannelOwnership(channelUsername) {
